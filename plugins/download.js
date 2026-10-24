@@ -22,7 +22,31 @@ const AUDIO_ONLY_EXT = new Set(['mp3', 'm4a', 'aac', 'opus', 'ogg', 'wav', 'wma'
 // Recent YouTube needs a JavaScript runtime for yt-dlp (node is in the Docker image). Old yt-dlp builds don't know
 // the flag, so retry once without it instead of failing.
 const JS_RUNTIME = process.env.YTDLP_JS_RUNTIME === undefined ? 'node' : process.env.YTDLP_JS_RUNTIME;
+// YouTube often blocks cloud/datacenter IPs ("Sign in to confirm you're not a bot"). Two mitigations:
+//  1) optional cookies: set YTDLP_COOKIES_B64 (base64 of a Netscape cookies.txt) on Railway
+//  2) on a block/format error, retry with other YouTube player clients (override with YTDLP_CLIENTS=a,b,c)
+function cookieArgs() {
+  const raw = process.env.YTDLP_COOKIES_B64 ? Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8') : (process.env.YTDLP_COOKIES || '');
+  if (!raw.trim()) return [];
+  const file = path.join(os.tmpdir(), 'ytdlp-cookies.txt');
+  try { if (!fs.existsSync(file)) fs.writeFileSync(file, raw.replace(/\\n/g, '\n'), { mode: 0o600 }); } catch (e) { console.error('[cookies]', e.message); return []; }
+  return ['--cookies', file];
+}
+const BLOCKED_RE = /Sign in to confirm|not a bot|Requested format is not available|HTTP Error 403|Precondition check failed|nsig|n challenge/i;
+const FALLBACK_CLIENTS = (process.env.YTDLP_CLIENTS || 'android_vr,tv,web_safari').split(',').map(x => x.trim()).filter(Boolean);
 async function runYtDlp(args, timeoutMs = 240000) {
+  const withCookies = [...cookieArgs(), ...args];
+  try { return await runYtDlpJs(withCookies, timeoutMs); }
+  catch (first) {
+    if (!BLOCKED_RE.test(first.message) || !args.some(a => /youtu|ytsearch/i.test(String(a)))) throw first;
+    for (const client of FALLBACK_CLIENTS) {
+      try { return await runYtDlpJs(['--extractor-args', `youtube:player_client=${client}`, ...withCookies], timeoutMs); }
+      catch (err) { console.error(`[yt-dlp client ${client}]`, String(err.message).split('\n').pop().slice(0, 200)); if (!BLOCKED_RE.test(err.message)) throw err; }
+    }
+    throw first;   // the first error is the most informative one
+  }
+}
+async function runYtDlpJs(args, timeoutMs = 240000) {
   if (!JS_RUNTIME) return runYtDlpRaw(args, timeoutMs);
   try { return await runYtDlpRaw(['--js-runtimes', JS_RUNTIME, ...args], timeoutMs); }
   catch (e) {
@@ -201,7 +225,10 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
     let message = '❌ Download එක අසාර්ථකයි.';
     if (/AUDIO_ONLY_RESULT/i.test(e.message)) message = '⚠️ මේ link එකට *video stream එකක් නැහැ* — audio track එකක් විතරයි හම්බුණේ, ඒ නිසා video file එක යැව්වේ නැහැ.\n🔁 වෙනත් post/link එකක් try කරන්න, හෝ video එක login/age/geo restricted වෙලා තියෙනවද බලන්න.';
     else if (/max-filesize|file is larger|too large/i.test(e.message)) message += `\n📏 File size limit: ${LIMIT_LABEL}. Railway memory/storage limits නිසා ඉතා විශාල files fail වෙන්න පුළුවන්.`;
-    else if (/yt-dlp|ENOENT|not found/i.test(e.message)) message += '\n🧰 yt-dlp install/update කරලා තියෙනවද බලන්න.';
+    else if (/Could not start yt-dlp|ENOENT/i.test(e.message)) message += '\n🧰 yt-dlp install වෙලා නැහැ (Railway: Dockerfile එකෙන් rebuild කරන්න).';
+    else if (/Sign in to confirm|not a bot/i.test(e.message)) message += '\n🤖 YouTube මේ server එකේ IP එක block කරලා ("not a bot" check). Fix: Railway Variables වල *YTDLP_COOKIES_B64* දාන්න (README බලන්න).';
+    else if (/Requested format is not available|nsig|n challenge/i.test(e.message)) message += '\n🧩 YouTube format/challenge error එකක් — yt-dlp update කරන්න (Railway redeploy), නැත්නම් cookies දාන්න.';
+    else if (/Video unavailable|Private video|members-only|has been removed|age/i.test(e.message)) message += '\n🚫 Video එක unavailable / private / age-restricted වෙන්න පුළුවන්.';
     else if (/timed out/i.test(e.message)) message += '\n⏱️ Download timeout වුණා; පොඩි video එකක් හෝ පසුව නැවත try කරන්න.';
     else message += '\n🌐 Link availability, login/age/geo restrictions සහ source platform changes පරීක්ෂා කරන්න.';
     message += '\n⚠️ ඔබට download කිරීමට අයිතිය ඇති content පමණක් භාවිත කරන්න.';
