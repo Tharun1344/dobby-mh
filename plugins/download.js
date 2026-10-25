@@ -9,9 +9,9 @@ try { ffmpegStaticPath = require('ffmpeg-static'); } catch { ffmpegStaticPath = 
 const MAX_BYTES = Math.max(10 * 1024 * 1024, Math.min(Number(process.env.MAX_DOWNLOAD_BYTES || 1900000000), 1900000000));
 const URL_RE = /^https?:\/\//i;
 const FFMPEG = process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
-// WhatsApp rejects/ stalls on "video" messages much above ~60 MB, so bigger files are re-encoded smaller first.
-const WA_VIDEO_LIMIT = Number(process.env.WA_VIDEO_LIMIT_BYTES || 60 * 1024 * 1024);
-const FFMPEG_TIMEOUT = Number(process.env.FFMPEG_TIMEOUT_MS || 600000);
+// Videos are sent as real video messages up to this size (default = the 1.9 GB download limit); only anything bigger is shrunk.
+const WA_VIDEO_LIMIT = Number(process.env.WA_VIDEO_LIMIT_BYTES || MAX_BYTES);
+const FFMPEG_TIMEOUT = Number(process.env.FFMPEG_TIMEOUT_MS || 1800000);
 const QUALITIES = new Set([144, 240, 360, 480, 720]);
 const LIMIT_LABEL = `${(MAX_BYTES / (1024 ** 3)).toFixed(2)} GiB`;
 // Extensions yt-dlp can produce with no video track at all. If a non-audio
@@ -29,13 +29,15 @@ function cookieArgs() {
   const raw = process.env.YTDLP_COOKIES_B64 ? Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8') : (process.env.YTDLP_COOKIES || '');
   if (!raw.trim()) return [];
   const file = path.join(os.tmpdir(), 'ytdlp-cookies.txt');
-  try { if (!fs.existsSync(file)) fs.writeFileSync(file, raw.replace(/\\n/g, '\n'), { mode: 0o600 }); } catch (e) { console.error('[cookies]', e.message); return []; }
+  try { if (!fs.existsSync(file)) fs.writeFileSync(file, raw.replace(/\\n/g, '\n').replace(/\r\n?/g, '\n'), { mode: 0o600 }); } catch (e) { console.error('[cookies]', e.message); return []; }
   return ['--cookies', file];
 }
+console.log(`[ytdlp] cookies: ${cookieArgs().length ? 'LOADED' : 'not set'} | proxy: ${process.env.YTDLP_PROXY ? 'set' : 'not set'}`);
 const BLOCKED_RE = /Sign in to confirm|not a bot|Requested format is not available|HTTP Error 403|Precondition check failed|nsig|n challenge/i;
 const FALLBACK_CLIENTS = (process.env.YTDLP_CLIENTS || 'android_vr,tv,web_safari').split(',').map(x => x.trim()).filter(Boolean);
 async function runYtDlp(args, timeoutMs = 240000) {
-  const withCookies = [...cookieArgs(), ...args];
+  const proxy = process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : [];
+  const withCookies = [...proxy, ...cookieArgs(), ...args];
   try { return await runYtDlpJs(withCookies, timeoutMs); }
   catch (first) {
     if (!BLOCKED_RE.test(first.message) || !args.some(a => /youtu|ytsearch/i.test(String(a)))) throw first;
@@ -94,7 +96,8 @@ async function makePlayableMp4(src, dir, codecs) {
   if (isMp4 && codecs.video === 'h264' && (!codecs.audio || codecs.audio === 'aac')) {
     await runFfmpeg(['-i', src, '-c', 'copy', '-movflags', '+faststart', out]);   // fast: no re-encode
   } else {
-    await runFfmpeg(['-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p',
+    const big = fs.statSync(src).size > 150 * 1024 * 1024;   // long video: favour speed over file size
+    await runFfmpeg(['-i', src, '-c:v', 'libx264', '-preset', big ? 'ultrafast' : 'veryfast', '-crf', big ? '28' : '26', '-pix_fmt', 'yuv420p',
       '-vf', "scale='min(1280,iw)':-2", '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out]);
   }
   return out;
@@ -184,7 +187,7 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
       const format = `bv*[vcodec^=avc1][height<=${height}]+ba[ext=m4a]/b[ext=mp4][height<=${height}]/bv*[height<=${height}]+ba/b[height<=${height}]/b`;
       args = [...common, '-f', format, '--merge-output-format', 'mp4', target];
     }
-    const { stdout, stderr } = await runYtDlp(args, Number(process.env.DOWNLOAD_TIMEOUT_MS || 600000));
+    const { stdout, stderr } = await runYtDlp(args, Number(process.env.DOWNLOAD_TIMEOUT_MS || 1800000));
     const printed = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
     let file = printed && fs.existsSync(printed) ? printed : null;
     if (!file) {
@@ -226,7 +229,9 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
     if (/AUDIO_ONLY_RESULT/i.test(e.message)) message = '⚠️ මේ link එකට *video stream එකක් නැහැ* — audio track එකක් විතරයි හම්බුණේ, ඒ නිසා video file එක යැව්වේ නැහැ.\n🔁 වෙනත් post/link එකක් try කරන්න, හෝ video එක login/age/geo restricted වෙලා තියෙනවද බලන්න.';
     else if (/max-filesize|file is larger|too large/i.test(e.message)) message += `\n📏 File size limit: ${LIMIT_LABEL}. Railway memory/storage limits නිසා ඉතා විශාල files fail වෙන්න පුළුවන්.`;
     else if (/Could not start yt-dlp|ENOENT/i.test(e.message)) message += '\n🧰 yt-dlp install වෙලා නැහැ (Railway: Dockerfile එකෙන් rebuild කරන්න).';
-    else if (/Sign in to confirm|not a bot/i.test(e.message)) message += '\n🤖 YouTube මේ server එකේ IP එක block කරලා ("not a bot" check). Fix: Railway Variables වල *YTDLP_COOKIES_B64* දාන්න (README බලන්න).';
+    else if (/Sign in to confirm|not a bot/i.test(e.message)) message += cookieArgs().length
+      ? '\n🍪 Cookies දාලා තියෙනවා, ඒත් YouTube තාම block කරනවා — cookies expire වෙලා හෝ වැරදියි. Incognito window එකකින් අලුතින් export කරලා *YTDLP_COOKIES_B64* update කරන්න.'
+      : '\n🤖 YouTube මේ server එකේ IP එක block කරලා ("not a bot" check). Fix: Railway Variables වල *YTDLP_COOKIES_B64* දාන්න.';
     else if (/Requested format is not available|nsig|n challenge/i.test(e.message)) message += '\n🧩 YouTube format/challenge error එකක් — yt-dlp update කරන්න (Railway redeploy), නැත්නම් cookies දාන්න.';
     else if (/Video unavailable|Private video|members-only|has been removed|age/i.test(e.message)) message += '\n🚫 Video එක unavailable / private / age-restricted වෙන්න පුළුවන්.';
     else if (/timed out/i.test(e.message)) message += '\n⏱️ Download timeout වුණා; පොඩි video එකක් හෝ පසුව නැවත try කරන්න.';
