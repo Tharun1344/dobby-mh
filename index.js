@@ -1,5 +1,9 @@
 'use strict';
 
+// Railway sets RAILWAY_VOLUME_MOUNT_PATH when a Volume is attached: use it automatically, so the WhatsApp session
+// (and settings/schedules) survive redeploys even if STORAGE_DIR was never set.
+if (!process.env.STORAGE_DIR && process.env.RAILWAY_VOLUME_MOUNT_PATH) process.env.STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+
 // libsignal prints huge "Closing session: SessionEntry {...}" dumps and Bad MAC traces to the console.
 // They are normal key-renegotiation noise; hide them so real errors are visible, and just count them.
 const SIGNAL_NOISE = /^(Closing session|Closing open session|Opening session|Removing old closed session|Migrating session|Decrypted message with closed session|Failed to decrypt message with any known session|Session error:)/;
@@ -263,6 +267,14 @@ async function connectAccount(account) {
   if (sockets.has(id)) return;
   try {
     fs.mkdirSync(account.sessionPath, { recursive: true });
+    {
+      const hasCreds = fs.existsSync(path.join(account.sessionPath, 'creds.json'));
+      const onRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+      console.log(`[SESSION] path=${account.sessionPath} | saved login: ${hasCreds ? 'FOUND (will reuse it)' : 'NOT FOUND (new pairing needed)'}`);
+      if (onRailway && !process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.STORAGE_DIR) {
+        console.error('[SESSION] ⚠️ No Railway Volume attached: the WhatsApp login is wiped on EVERY deploy, and each deploy leaves a ghost linked device behind (that is what causes "No sessions" errors). Add a Volume (mount path /data).');
+      }
+    }
     await restoreMegaSession(account.sessionId, account.sessionPath);
     const { state, saveCreds } = await useMultiFileAuthState(account.sessionPath);
     const { version } = await fetchLatestBaileysVersion();
@@ -276,6 +288,27 @@ async function connectAccount(account) {
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
     });
+    // WhatsApp now addresses chats by "@lid". Sending to our OWN lid (self-chat) fails with "No sessions" on this Baileys
+    // version, while the phone-number JID works. So: self-chat -> phone JID, and on "No sessions" retry via the learned number.
+    {
+      const origSend = sock.sendMessage.bind(sock);
+      let hinted = 0;
+      sock.sendMessage = async (jid, content, options) => {
+        const pn = normalizeJid(sock.user?.id || ''), lid = normalizeJid(sock.user?.lid || '');
+        const target = (lid && pn && normalizeJid(jid) === lid) ? pn : jid;
+        try { return await origSend(target, content, options); }
+        catch (err) {
+          if (!/No sessions/i.test(err?.message || '')) throw err;
+          const alt = lidMap.get(normalizeJid(target));
+          if (alt && alt !== target) { try { return await origSend(alt, content, options); } catch { /* fall through */ } }
+          if (Date.now() - hinted > 3600000) {
+            hinted = Date.now();
+            console.error('[HINT] "No sessions" = this WhatsApp account has a stale/extra linked device (usually left behind by an earlier deploy). Phone > WhatsApp > Linked devices: log out every old "Firefox" entry, keep only the one bot that is running now.');
+          }
+          throw err;
+        }
+      };
+    }
     let pairingRequested = false;
     sockets.set(id, sock);
     sock.ev.on('creds.update', saveCreds);
