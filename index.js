@@ -4,6 +4,9 @@
 // (and settings/schedules) survive redeploys even if STORAGE_DIR was never set.
 if (!process.env.STORAGE_DIR && process.env.RAILWAY_VOLUME_MOUNT_PATH) process.env.STORAGE_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH;
 
+// Must run BEFORE Baileys is loaded (fixes "No sessions" send failures on @lid accounts).
+try { require('./scripts/patch-baileys'); } catch (e) { console.error('[patch-baileys] failed:', e.message); }
+
 // libsignal prints huge "Closing session: SessionEntry {...}" dumps and Bad MAC traces to the console.
 // They are normal key-renegotiation noise; hide them so real errors are visible, and just count them.
 const SIGNAL_NOISE = /^(Closing session|Closing open session|Opening session|Removing old closed session|Migrating session|Decrypted message with closed session|Failed to decrypt message with any known session|Session error:)/;
