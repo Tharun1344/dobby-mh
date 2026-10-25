@@ -34,19 +34,22 @@ function cookieArgs() {
 }
 console.log(`[ytdlp] cookies: ${cookieArgs().length ? 'LOADED' : 'not set'} | proxy: ${process.env.YTDLP_PROXY ? 'set' : 'not set'}`);
 const BLOCKED_RE = /Sign in to confirm|not a bot|Requested format is not available|HTTP Error 403|Precondition check failed|nsig|n challenge/i;
-const FALLBACK_CLIENTS = (process.env.YTDLP_CLIENTS || 'android_vr,tv,web_safari').split(',').map(x => x.trim()).filter(Boolean);
+const FALLBACK_CLIENTS = (process.env.YTDLP_CLIENTS || 'web,mweb,android,ios,tv,android_vr,web_safari').split(',').map(x => x.trim()).filter(Boolean);
 async function runYtDlp(args, timeoutMs = 240000) {
   const proxy = process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : [];
   const withCookies = [...proxy, ...cookieArgs(), ...args];
-  try { return await runYtDlpJs(withCookies, timeoutMs); }
-  catch (first) {
-    if (!BLOCKED_RE.test(first.message) || !args.some(a => /youtu|ytsearch/i.test(String(a)))) throw first;
-    for (const client of FALLBACK_CLIENTS) {
-      try { return await runYtDlpJs(['--extractor-args', `youtube:player_client=${client}`, ...withCookies], timeoutMs); }
-      catch (err) { console.error(`[yt-dlp client ${client}]`, String(err.message).split('\n').pop().slice(0, 200)); if (!BLOCKED_RE.test(err.message)) throw err; }
+  let firstErr;
+  for (const client of ['', ...FALLBACK_CLIENTS]) {
+    try {
+      const clientArgs = client ? ['--extractor-args', `youtube:player_client=${client}`, ...withCookies] : withCookies;
+      return await runYtDlpJs(clientArgs, timeoutMs);
+    } catch (err) {
+      if (!firstErr) firstErr = err;
+      console.error(`[yt-dlp client ${client || 'default'}]`, String(err.message).split('\n').pop().slice(0, 200));
+      if (!BLOCKED_RE.test(err.message) && !/Requested format is not available/i.test(err.message)) throw err;
     }
-    throw first;   // the first error is the most informative one
   }
+  throw firstErr || new Error('All YouTube client extractors failed');
 }
 async function runYtDlpJs(args, timeoutMs = 240000) {
   if (!JS_RUNTIME) return runYtDlpRaw(args, timeoutMs);
@@ -79,7 +82,6 @@ function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT) {
     child.on('close', code => code === 0 ? done(null, stderr) : done(new Error(`ffmpeg exited ${code}: ${stderr.slice(-600)}`)));
   });
 }
-// `ffmpeg -i file` always "fails" (no output file) but prints the stream codecs on stderr.
 async function probeCodecs(file) {
   const info = await new Promise(resolve => {
     const child = spawn(FFMPEG, ['-hide_banner', '-i', file], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -88,15 +90,13 @@ async function probeCodecs(file) {
   });
   return { video: (info.match(/Video: ([a-z0-9_]+)/i) || [])[1] || '', audio: (info.match(/Audio: ([a-z0-9_]+)/i) || [])[1] || '' };
 }
-// WhatsApp only plays H.264 + AAC in an MP4 container (with the index at the front). yt-dlp can hand back
-// VP9/AV1 + Opus (webm/mkv) which WhatsApp shows as a file that will not play, so make sure it is the right thing.
 async function makePlayableMp4(src, dir, codecs) {
   const out = path.join(dir, 'playable.mp4');
   const isMp4 = path.extname(src).toLowerCase() === '.mp4';
   if (isMp4 && codecs.video === 'h264' && (!codecs.audio || codecs.audio === 'aac')) {
-    await runFfmpeg(['-i', src, '-c', 'copy', '-movflags', '+faststart', out]);   // fast: no re-encode
+    await runFfmpeg(['-i', src, '-c', 'copy', '-movflags', '+faststart', out]);
   } else {
-    const big = fs.statSync(src).size > 150 * 1024 * 1024;   // long video: favour speed over file size
+    const big = fs.statSync(src).size > 150 * 1024 * 1024;
     await runFfmpeg(['-i', src, '-c:v', 'libx264', '-preset', big ? 'ultrafast' : 'veryfast', '-crf', big ? '28' : '26', '-pix_fmt', 'yuv420p',
       '-vf', "scale='min(1280,iw)':-2", '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out]);
   }
@@ -130,13 +130,11 @@ function inputTarget(q, searchPrefix = 'ytsearch1:') {
 async function sendAsDocument(sock, c, file, title, ext, mime, note = '') {
   const stat = fs.statSync(file);
   if (stat.size > MAX_BYTES) throw new Error(`File is larger than configured limit ${LIMIT_LABEL}`);
-  // Baileys accepts a file path as media URL; avoid loading multi-GB files into RAM.
   await sock.sendMessage(c.from, {
     document: { url: file }, mimetype: mime, fileName: safeName(`${title}.${ext}`, `download.${ext}`),
     caption: `✅ *Download complete*\n📏 ${(stat.size / (1024 * 1024)).toFixed(1)} MB${note ? `\n${note}` : ''}`
   }, { quoted: c.quoted });
 }
-// Send as a normal, playable WhatsApp video (not a document). Tries file URL, then stream, then buffer.
 async function sendAsVideo(sock, c, file, title, thumb, qualityLabel) {
   const size = fs.statSync(file).size;
   const caption = `🎬 *${title}*\n📏 ${(size / (1024 * 1024)).toFixed(1)} MB${qualityLabel ? ` • ${qualityLabel}` : ''}`;
@@ -156,7 +154,6 @@ async function sendAsAudio(sock, c, file, title) {
 }
 async function downloadCommand(sock, mek, _msg, c, mode) {
   let target;
-  // Optional quality: ".ytvideo 360 song name" (144/240/360/480/720). Default per command.
   let height = mode.height;
   const qMatch = String(c.q || '').trim().match(/^(\d{3})p?\s+(.+)$/s);
   if (!mode.audio && qMatch && QUALITIES.has(Number(qMatch[1]))) { height = Number(qMatch[1]); c = { ...c, q: qMatch[2] }; }
@@ -169,22 +166,13 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
   try {
     await c.reply(`⏳ *${mode.label}* සූදානම් කරනවා…\n🔎 Name එකක් හෝ URL එකක් දෙන්න පුළුවන්.\n🎬 ${mode.audio ? 'Audio' : 'Video (play කරන්න පුළුවන් mp4)'} එකක් විදිහට යවනවා.`);
     const out = path.join(dir, '%(title).150B.%(ext)s');
-    const common = ['--no-playlist','--no-warnings','--newline','--socket-timeout','30','--retries','3','--fragment-retries','3','--no-part','--max-filesize',String(MAX_BYTES),'-o',out,'--print','after_move:filepath'];
-    // Without a working ffmpeg, yt-dlp can't merge a separate video+audio
-    // pair and silently drops to whatever single-file format is available —
-    // which for some sources (e.g. Facebook) can end up audio-only. Pointing
-    // explicitly at ffmpeg-static makes the merge reliable regardless of
-    // what's on PATH.
+    const common = ['--no-playlist','--no-warnings','--newline','--socket-timeout','30','--retries','3','--fragment-retries','3','--no-part','--geo-bypass','--no-check-certificates','--max-filesize',String(MAX_BYTES),'-o',out,'--print','after_move:filepath'];
     if (ffmpegStaticPath) common.push('--ffmpeg-location', ffmpegStaticPath);
     let args;
     if (mode.audio) {
       args = [...common, '-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '0', target];
     } else {
-      // 480p YouTube; 720p for other supported services. bv*/ba (rather than
-      // the bestvideo/bestaudio aliases) are the more reliable yt-dlp
-      // selectors across sources that don't tag every format with a height.
-      // Prefer H.264 + AAC (plays in WhatsApp as-is); anything else is converted below.
-      const format = `bv*[vcodec^=avc1][height<=${height}]+ba[ext=m4a]/b[ext=mp4][height<=${height}]/bv*[height<=${height}]+ba/b[height<=${height}]/b`;
+      const format = `bv*[height<=${height}]+ba/b[height<=${height}]/b/best`;
       args = [...common, '-f', format, '--merge-output-format', 'mp4', target];
     }
     const { stdout, stderr } = await runYtDlp(args, Number(process.env.DOWNLOAD_TIMEOUT_MS || 1800000));
@@ -230,7 +218,7 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
     else if (/max-filesize|file is larger|too large/i.test(e.message)) message += `\n📏 File size limit: ${LIMIT_LABEL}. Railway memory/storage limits නිසා ඉතා විශාල files fail වෙන්න පුළුවන්.`;
     else if (/Could not start yt-dlp|ENOENT/i.test(e.message)) message += '\n🧰 yt-dlp install වෙලා නැහැ (Railway: Dockerfile එකෙන් rebuild කරන්න).';
     else if (/Sign in to confirm|not a bot/i.test(e.message)) message += cookieArgs().length
-      ? '\n🍪 Cookies දාලා තියෙනවා, ඒත් YouTube තාම block කරනවා — cookies expire වෙලා හෝ වැරදියි. Incognito window එකකින් අලුතින් export කරලා *YTDLP_COOKIES_B64* update කරන්න.'
+      ? '\n🍪 Cookies දාලා තියෙනවා, ඒත් YouTube තාම block කරනවා — cookies expire වෙලා හෝ වැරදියයි. Incognito window එකකින් අලුතින් export කරලා *YTDLP_COOKIES_B64* update කරන්න.'
       : '\n🤖 YouTube මේ server එකේ IP එක block කරලා ("not a bot" check). Fix: Railway Variables වල *YTDLP_COOKIES_B64* දාන්න.';
     else if (/Requested format is not available|nsig|n challenge/i.test(e.message)) message += '\n🧩 YouTube format/challenge error එකක් — yt-dlp update කරන්න (Railway redeploy), නැත්නම් cookies දාන්න.';
     else if (/Video unavailable|Private video|members-only|has been removed|age/i.test(e.message)) message += '\n🚫 Video එක unavailable / private / age-restricted වෙන්න පුළුවන්.';
