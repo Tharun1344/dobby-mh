@@ -281,7 +281,18 @@ async function connectAccount(account) {
     await restoreMegaSession(account.sessionId, account.sessionPath);
     const { state, saveCreds } = await useMultiFileAuthState(account.sessionPath);
     const { version } = await fetchLatestBaileysVersion();
+    // Keep what we sent for a while: when a phone/device cannot decrypt a message it asks us to send it again, and
+    // without getMessage() we cannot, so the chat is stuck on "Waiting for this message. This may take a while".
+    const sentCache = new Map();
+    const rememberSent = res => {
+      if (res?.key?.id && res.message) {
+        sentCache.set(res.key.id, res.message);
+        if (sentCache.size > 1000) sentCache.delete(sentCache.keys().next().value);
+      }
+      return res;
+    };
     const sock = makeWASocket({
+      getMessage: async key => sentCache.get(key?.id) || undefined,
       logger: P({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' }),
       printQRInTerminal: false,
       browser: Browsers.macOS('Firefox'),
@@ -299,11 +310,11 @@ async function connectAccount(account) {
       sock.sendMessage = async (jid, content, options) => {
         const pn = normalizeJid(sock.user?.id || ''), lid = normalizeJid(sock.user?.lid || '');
         const target = (lid && pn && normalizeJid(jid) === lid) ? pn : jid;
-        try { return await origSend(target, content, options); }
+        try { return rememberSent(await origSend(target, content, options)); }
         catch (err) {
           if (!/No sessions/i.test(err?.message || '')) throw err;
           const alt = lidMap.get(normalizeJid(target));
-          if (alt && alt !== target) { try { return await origSend(alt, content, options); } catch { /* fall through */ } }
+          if (alt && alt !== target) { try { return rememberSent(await origSend(alt, content, options)); } catch { /* fall through */ } }
           if (Date.now() - hinted > 3600000) {
             hinted = Date.now();
             console.error('[HINT] "No sessions" = this WhatsApp account has a stale/extra linked device (usually left behind by an earlier deploy). Phone > WhatsApp > Linked devices: log out every old "Firefox" entry, keep only the one bot that is running now.');
