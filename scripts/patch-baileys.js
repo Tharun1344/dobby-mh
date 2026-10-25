@@ -12,10 +12,21 @@ function patch() {
   catch { return 'baileys not found'; }
   let src;
   try { src = fs.readFileSync(file, 'utf8'); } catch (e) { return `cannot read: ${e.message}`; }
-  if (src.includes('dobby-patch')) return 'already patched';
+  if (src.includes('dobby-patch-v2')) return 'already patched';
 
   const oldEncrypt = "            const { type, ciphertext } = await signalRepository.encryptMessage({ jid, data: bytes });\n";
   const newEncrypt =
+`            let encrypted; /* dobby-patch-v2 */
+            try { encrypted = await signalRepository.encryptMessage({ jid, data: bytes }); }
+            catch (err) {
+                // Never silently skip the main phone (device 0): that would make the message "wait" forever. Only extra/ghost devices.
+                const dev = (String(jid).match(/:(\\d+)@/) || [])[1];
+                if (dev && Number(dev) !== 0 && /No sessions/i.test((err && err.message) || '')) { console.error('[patch] skipping device without a session:', jid); return null; }
+                throw err;
+            }
+            const { type, ciphertext } = encrypted;
+`;
+  const v1Block =
 `            let encrypted; /* dobby-patch */
             try { encrypted = await signalRepository.encryptMessage({ jid, data: bytes }); }
             catch (err) { if (/No sessions/i.test((err && err.message) || '')) { console.error('[patch] skipping device without a session:', jid); return null; } throw err; }
@@ -23,6 +34,10 @@ function patch() {
 `;
   const oldReturn = "        }));\n        return { nodes, shouldIncludeDeviceIdentity };\n    };\n    const relayMessage";
   const newReturn = "        }));\n        return { nodes: nodes.filter(n => n && n.tag), shouldIncludeDeviceIdentity };\n    };\n    const relayMessage";
+  if (src.includes('dobby-patch') && src.split(v1Block).length === 2) {          // upgrade the first version of this patch
+    try { fs.writeFileSync(file, src.replace(v1Block, newEncrypt)); } catch (e) { return `cannot write: ${e.message}`; }
+    return 'patch upgraded';
+  }
   if (src.split(oldEncrypt).length !== 2 || src.split(oldReturn).length !== 2) return 'unexpected Baileys version, patch skipped';
   try { fs.writeFileSync(file, src.replace(oldEncrypt, newEncrypt).replace(oldReturn, newReturn)); }
   catch (e) { return `cannot write: ${e.message}`; }
