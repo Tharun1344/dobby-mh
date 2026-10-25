@@ -22,19 +22,23 @@ const AUDIO_ONLY_EXT = new Set(['mp3', 'm4a', 'aac', 'opus', 'ogg', 'wav', 'wma'
 // Recent YouTube needs a JavaScript runtime for yt-dlp (node is in the Docker image). Old yt-dlp builds don't know
 // the flag, so retry once without it instead of failing.
 const JS_RUNTIME = process.env.YTDLP_JS_RUNTIME === undefined ? 'node' : process.env.YTDLP_JS_RUNTIME;
-// YouTube often blocks cloud/datacenter IPs ("Sign in to confirm you're not a bot"). Two mitigations:
-//  1) optional cookies: set YTDLP_COOKIES_B64 (base64 of a Netscape cookies.txt) on Railway
-//  2) on a block/format error, retry with other YouTube player clients (override with YTDLP_CLIENTS=a,b,c)
+
+// Embedded cookies base64 string so you don't need to set any environment variables!
+const EMBEDDED_COOKIES_B64 = "IyBOZXRzY2FwZSBIVFRQIENvb2tpZSBGaWxlCiMgaHR0cHM6Ly9jdXJsLmhheHguc2UvcmZjL2Nvb2tpZV9zcGVjLmh0bWwKIyBUaGlzIGlzIGEgZ2VuZXJhdGVkIGZpbGUhIERvIG5vdCBlZGl0LgoKLnlvdXR1YmUuY29tCVRSVUUJLwFGQUxTRQkxODI3NDc4MDIwCUhTSUQJQXFKUHB2T1ZQRmpTMG1wa2wKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODI3NDc4MDIwCVNTSUQJQUhEQmtkZzI4SEV4UnFrQkgKLnlvdXR1YmUuY29tCVRSVUUJLwFGQUxTRQkxODI3NDc4MDIwCkFQSVNJRABSbVBoV3dKQVNaVlJKSlkvQWNZUUFHUERsOENDUzhzVjAKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODI3NDc4MDIwCVNBUElTSUQJbzlqTUNpZkFQaHQ0UEVDL0FQa3pNZlNrdHpjSEQxSGFIQgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNzQ3ODAyMAlfX1NlY3VyZS0xUEFQSVNJRApvOWpNQ2lmQVBodDRQRTRDL0FQa3pNZlNrdHpjSEQxSGFIQgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNzQ3ODAyMAlfX1NlY3VyZS0zUEFQSVNJRApvOWpNQ2lmQVBodDRQRTRDL0FQa3pNZlNrdHpjSEQxSGFIQgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNzQ3ODAyMAlfX1NlY3VyZS0zUFNJRAJnLmEwMDBFQW1kYXMtbTVVoR0JQeEFHb25XOVBQQ0k5N1NLYWdXd0djeHZKcnhfVHJDakJoVllTcVFHd3dPb3lYTWpNV01FZTJXdUFBQ2dZS0FTQVNBUkFTRlFHSFgyTWlZSGFJMnhvLUI3VEVqTWYzeVJ5ZWdob1ZBVUY4WUtvYjZBRXlBbEhkOHZsblJfWlpFATh3MDA3NgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNzQ3ODA4OQlQUkVGCWY2PTQwMDAwMDAwJnR6PUFzaWEuQ29sb21ibwoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNzQ3ODA3NwlMT0dJTl9JTkZPCkFGbW1GMnN3UlFJZ0tTVzZRaUd2RGdaRmhhc20yN1hDY1JfT3hDX1Y3V1ZBdC0tUzhzUlFWWllDSVFDVFdzWmpvVUlXb0FNWEJmZl84a3VWa2pQSWNZdndneVlIWUpVREZHWmp1QToJUVVRM0pqTnB3W2VMSkQ0ZEozZDFXRjRtY2VsOGhwYUxSdVg4MFFWODc1Sl9SZTVuVk9hNlloOE5fdGpucWJrbUpBRDVkSEhBRWo2WnYxaTZtRU1lbFNHcDV0S1JMdi1nMXlzVzRPQjBtaE4zUml6b2NUbFZqZmZvbG1Rc0RaV044VFhpNC1vem9ndngtdjFQYTZnSzRncDJjNkdYTVg5cVFBWktnCW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTkyOTE4NjkwCkNPTlNJU1RFTkNZAEFJVWRuOGI5UVBSM1l2bTlYSVcyWktjaUh6ZFhVLWhSRVo1RzNvZFBkZUplWFdjem5WYmdZY3dxdGZlYbY2Vnb2hfMGJwSFFHc2FNUUJuRWJNN3RTX3hITmRhODBfcXZ5T0VBRWhhcUxWdkRyU25nQ0l3eFFsUl9VVGliaC1aUzVvNk1JTGJsanJpdnIxd1lENjRmCW5vdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODI0NDU0MDk2CV9fU2VjdXVyZS0xPSFQU0lEVFMJc2lkdHMtQ2pVQmtsZGpfendnM2tFaHN5YzBfVUhXRU9kcEtRMXFPOlBOaVBaTGpnUFZRbjhhNVBXQUVgRnFKNDdxWkhkMWNibHZjaXJJb3hBQQoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgyNDQ1NDA5NglfX1NlY3VyZS0zUFNJRElTSXN0cy1DbkpVS2xkal96Z1MzZ0Voc3ljMF9VSDdFT0RwS1ExcU85UE5pUFpMSmdQVlFuOGE1UFdBRTFGc0o0N3FaSGQxY2JsdmNpcklveEFBCi55b3V0dWJlLm1jb20JVFJVRQkvCVRSVUUJMAJZU0MJQTJJcVJEalNZUUUKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODA4NDcwMDc4CVZJU0lUT1JfSU5GTzFMSUVEREluNk04b2ZEcjAKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODA4NDcwMDc4CVZJU0lUT1JfUFJJVkFDWV9NRVRBREFUQQJDZ0pMU3hJRUdnQWdLQSUzRkIKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFAkxODA4NDcwMDczCV9fU2VjdXJlLVlOSUQJQ3RvQkFVU2pBRUI4UVp1Wmc5cVJIa0xrbTN1dTNCNkExOWZuUHBKdWYzRC1LSENrdWpSaHNFMmduTHRweG51bWFnRlktUWI2djQ4cHFVRllGRVJDcl92STI5TUEyRTdvdWxFaFBpQWlLVjU2UmVkT2dVb0lqbXliTDF2QlVVUEd6MThrc3BBMkFRRXNjSjJvNVJBakxwRDhSZVRqV2o0ZEs2aXVrNVpDSmpuYWlYOWI4QmJNV01jZDd2dHp3eFhXV2ppdHRTZkFNayVCM3FtZFQza3FlYy0yajdpV285aUxWbzdETnRNajFFdGloV0gzc1RQNVpPTWc2eVBFQWhuZWF5VmZlOWk2RHd5RENUMDhZT1JJLXNXcGt1Mko3aGgxYVJYUUZRYw==";
+
 function cookieArgs() {
-  const raw = process.env.YTDLP_COOKIES_B64 ? Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8') : (process.env.YTDLP_COOKIES || '');
+  const rawEnv = process.env.YTDLP_COOKIES_B64 || process.env.YTDLP_COOKIES || '';
+  const raw = rawEnv.trim() ? rawEnv : Buffer.from(EMBEDDED_COOKIES_B64, 'base64').toString('utf8');
   if (!raw.trim()) return [];
   const file = path.join(os.tmpdir(), 'ytdlp-cookies.txt');
   try { if (!fs.existsSync(file)) fs.writeFileSync(file, raw.replace(/\\n/g, '\n').replace(/\r\n?/g, '\n'), { mode: 0o600 }); } catch (e) { console.error('[cookies]', e.message); return []; }
   return ['--cookies', file];
 }
-console.log(`[ytdlp] cookies: ${cookieArgs().length ? 'LOADED' : 'not set'} | proxy: ${process.env.YTDLP_PROXY ? 'set' : 'not set'}`);
+
+console.log(`[ytdlp] cookies: ${cookieArgs().length ? 'LOADED (Embedded/Env)' : 'not set'} | proxy: ${process.env.YTDLP_PROXY ? 'set' : 'not set'}`);
 const BLOCKED_RE = /Sign in to confirm|not a bot|Requested format is not available|HTTP Error 403|Precondition check failed|nsig|n challenge/i;
 const FALLBACK_CLIENTS = (process.env.YTDLP_CLIENTS || 'web,mweb,android,ios,tv,android_vr,web_safari').split(',').map(x => x.trim()).filter(Boolean);
+
 async function runYtDlp(args, timeoutMs = 240000) {
   const proxy = process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : [];
   const withCookies = [...proxy, ...cookieArgs(), ...args];
@@ -51,6 +55,7 @@ async function runYtDlp(args, timeoutMs = 240000) {
   }
   throw firstErr || new Error('All YouTube client extractors failed');
 }
+
 async function runYtDlpJs(args, timeoutMs = 240000) {
   if (!JS_RUNTIME) return runYtDlpRaw(args, timeoutMs);
   try { return await runYtDlpRaw(['--js-runtimes', JS_RUNTIME, ...args], timeoutMs); }
@@ -59,6 +64,7 @@ async function runYtDlpJs(args, timeoutMs = 240000) {
     throw e;
   }
 }
+
 function runYtDlpRaw(args, timeoutMs = 240000) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.env.YTDLP_BIN || 'yt-dlp', args, { stdio: ['ignore','pipe','pipe'] });
@@ -71,6 +77,7 @@ function runYtDlpRaw(args, timeoutMs = 240000) {
     child.on('close', code => code === 0 ? done(null, { stdout, stderr }) : done(new Error(stderr.slice(-1800) || `yt-dlp exited ${code}`)));
   });
 }
+
 function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT) {
   return new Promise((resolve, reject) => {
     const child = spawn(FFMPEG, ['-hide_banner', '-y', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -82,6 +89,7 @@ function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT) {
     child.on('close', code => code === 0 ? done(null, stderr) : done(new Error(`ffmpeg exited ${code}: ${stderr.slice(-600)}`)));
   });
 }
+
 async function probeCodecs(file) {
   const info = await new Promise(resolve => {
     const child = spawn(FFMPEG, ['-hide_banner', '-i', file], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -90,6 +98,7 @@ async function probeCodecs(file) {
   });
   return { video: (info.match(/Video: ([a-z0-9_]+)/i) || [])[1] || '', audio: (info.match(/Audio: ([a-z0-9_]+)/i) || [])[1] || '' };
 }
+
 async function makePlayableMp4(src, dir, codecs) {
   const out = path.join(dir, 'playable.mp4');
   const isMp4 = path.extname(src).toLowerCase() === '.mp4';
@@ -102,12 +111,14 @@ async function makePlayableMp4(src, dir, codecs) {
   }
   return out;
 }
+
 async function shrinkToFit(src, dir) {
   const out = path.join(dir, 'small.mp4');
   await runFfmpeg(['-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '30', '-pix_fmt', 'yuv420p',
     '-vf', "scale=-2:'min(360,ih)'", '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', out]);
   return out;
 }
+
 async function makeThumb(src, dir) {
   try {
     const out = path.join(dir, 'thumb.jpg');
@@ -116,7 +127,9 @@ async function makeThumb(src, dir) {
     return fs.readFileSync(out);
   } catch { return undefined; }
 }
+
 function safeName(name, fallback) { return String(name || fallback).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 160) || fallback; }
+
 function inputTarget(q, searchPrefix = 'ytsearch1:') {
   const raw = String(q || '').trim();
   if (!raw) throw new Error('Give a video/song name or URL.');
@@ -127,6 +140,7 @@ function inputTarget(q, searchPrefix = 'ytsearch1:') {
   }
   return searchPrefix + raw;
 }
+
 async function sendAsDocument(sock, c, file, title, ext, mime, note = '') {
   const stat = fs.statSync(file);
   if (stat.size > MAX_BYTES) throw new Error(`File is larger than configured limit ${LIMIT_LABEL}`);
@@ -135,6 +149,7 @@ async function sendAsDocument(sock, c, file, title, ext, mime, note = '') {
     caption: `✅ *Download complete*\n📏 ${(stat.size / (1024 * 1024)).toFixed(1)} MB${note ? `\n${note}` : ''}`
   }, { quoted: c.quoted });
 }
+
 async function sendAsVideo(sock, c, file, title, thumb, qualityLabel) {
   const size = fs.statSync(file).size;
   const caption = `🎬 *${title}*\n📏 ${(size / (1024 * 1024)).toFixed(1)} MB${qualityLabel ? ` • ${qualityLabel}` : ''}`;
@@ -147,11 +162,13 @@ async function sendAsVideo(sock, c, file, title, thumb, qualityLabel) {
   }
   throw lastErr || new Error('Could not send video');
 }
+
 async function sendAsAudio(sock, c, file, title) {
   const size = fs.statSync(file).size;
   await sock.sendMessage(c.from, { audio: { url: file }, mimetype: 'audio/mpeg', fileName: safeName(`${title}.mp3`, 'song.mp3') }, { quoted: c.quoted });
   await sock.sendMessage(c.from, { text: `🎵 *${title}*\n📏 ${(size / (1024 * 1024)).toFixed(1)} MB` }, { quoted: c.quoted }).catch(() => {});
 }
+
 async function downloadCommand(sock, mek, _msg, c, mode) {
   let target;
   let height = mode.height;
@@ -217,10 +234,8 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
     if (/AUDIO_ONLY_RESULT/i.test(e.message)) message = '⚠️ මේ link එකට *video stream එකක් නැහැ* — audio track එකක් විතරයි හම්බුණේ, ඒ නිසා video file එක යැව්වේ නැහැ.\n🔁 වෙනත් post/link එකක් try කරන්න, හෝ video එක login/age/geo restricted වෙලා තියෙනවද බලන්න.';
     else if (/max-filesize|file is larger|too large/i.test(e.message)) message += `\n📏 File size limit: ${LIMIT_LABEL}. Railway memory/storage limits නිසා ඉතා විශාල files fail වෙන්න පුළුවන්.`;
     else if (/Could not start yt-dlp|ENOENT/i.test(e.message)) message += '\n🧰 yt-dlp install වෙලා නැහැ (Railway: Dockerfile එකෙන් rebuild කරන්න).';
-    else if (/Sign in to confirm|not a bot/i.test(e.message)) message += cookieArgs().length
-      ? '\n🍪 Cookies දාලා තියෙනවා, ඒත් YouTube තාම block කරනවා — cookies expire වෙලා හෝ වැරදියයි. Incognito window එකකින් අලුතින් export කරලා *YTDLP_COOKIES_B64* update කරන්න.'
-      : '\n🤖 YouTube මේ server එකේ IP එක block කරලා ("not a bot" check). Fix: Railway Variables වල *YTDLP_COOKIES_B64* දාන්න.';
-    else if (/Requested format is not available|nsig|n challenge/i.test(e.message)) message += '\n🧩 YouTube format/challenge error එකක් — yt-dlp update කරන්න (Railway redeploy), නැත්නම් cookies දාන්න.';
+    else if (/Sign in to confirm|not a bot/i.test(e.message)) message += '\n🍪 Cookies embedded කරලා තියෙනවා, ඒත් YouTube එකෙන් අලුත් block එකක් දාලා තියෙනවා නම් cookies update කරන්න වෙයි.';
+    else if (/Requested format is not available|nsig|n challenge/i.test(e.message)) message += '\n🧩 YouTube format/challenge error එකක් — yt-dlp update කරන්න (Railway redeploy).';
     else if (/Video unavailable|Private video|members-only|has been removed|age/i.test(e.message)) message += '\n🚫 Video එක unavailable / private / age-restricted වෙන්න පුළුවන්.';
     else if (/timed out/i.test(e.message)) message += '\n⏱️ Download timeout වුණා; පොඩි video එකක් හෝ පසුව නැවත try කරන්න.';
     else message += '\n🌐 Link availability, login/age/geo restrictions සහ source platform changes පරීක්ෂා කරන්න.';
@@ -228,6 +243,7 @@ async function downloadCommand(sock, mek, _msg, c, mode) {
     await c.reply(message);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
+
 cmd({ pattern: 'ytsearch', alias: ['musicsearch','videosearch'], desc: 'Search YouTube results (metadata only)', category: 'download' }, async (_s,_m,_msg,c) => {
   if (!c.q) return c.reply(`🔎 භාවිතය: ${c.prefix}ytsearch song/video name`);
   try {
