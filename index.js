@@ -373,7 +373,19 @@ async function connectAccount(account) {
         sockets.delete(id);
         const statusCode = update.lastDisconnect?.error?.output?.statusCode;
         if (statusCode === DisconnectReason.loggedOut) {
-          logger.error({ accountId: id }, 'WhatsApp session logged out; re-pair this account before restarting it.');
+          // The phone logged this device out (or WhatsApp revoked it): the saved login is useless now. Wipe it and start
+          // a fresh pairing automatically, so no shell access to the Railway volume is needed. Gives up after 3 resets
+          // in 10 minutes to avoid a loop.
+          const now = Date.now();
+          const recent = (global.__logoutResets = (global.__logoutResets || []).filter(t => now - t < 600000));
+          if (recent.length >= 3) { console.error('[SESSION] Logged out 3 times in 10 minutes — not resetting again. Check Linked devices on the phone, then redeploy.'); return; }
+          recent.push(now);
+          try {
+            for (const entry of fs.readdirSync(account.sessionPath)) fs.rmSync(path.join(account.sessionPath, entry), { recursive: true, force: true });
+            console.log('[SESSION] WhatsApp logged this device out. The saved login was wiped — a NEW pairing code will appear below, enter it in WhatsApp > Linked devices.');
+          } catch (err) { console.error('[SESSION] Could not wipe the old login:', err.message); }
+          clearTimeout(reconnectTimers.get(id));
+          reconnectTimers.set(id, setTimeout(() => connectAccount(account), 3000));
           return;
         }
         const attempts = (reconnectAttempts.get(id) || 0) + 1;
