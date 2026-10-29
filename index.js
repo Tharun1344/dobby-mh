@@ -302,25 +302,29 @@ async function connectAccount(account) {
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
     });
-    // WhatsApp now addresses chats by "@lid". Sending to our OWN lid (self-chat) fails with "No sessions" on this Baileys
-    // version, while the phone-number JID works. So: self-chat -> phone JID, and on "No sessions" retry via the learned number.
+    // Self-chat addressing. WhatsApp now addresses chats by "@lid", so messages to our OWN chat are sent to the LID first
+    // (that is what the phone expects; the phone-number JID can show up as "Waiting for this message" on the phone).
+    // If that fails with "No sessions" we retry with the phone JID. SELF_ADDRESS=pn flips the order.
     {
       const origSend = sock.sendMessage.bind(sock);
       let hinted = 0;
+      const preferPn = String(process.env.SELF_ADDRESS || 'lid').toLowerCase() === 'pn';
       sock.sendMessage = async (jid, content, options) => {
         const pn = normalizeJid(sock.user?.id || ''), lid = normalizeJid(sock.user?.lid || '');
-        const target = (lid && pn && normalizeJid(jid) === lid) ? pn : jid;
-        try { return rememberSent(await origSend(target, content, options)); }
-        catch (err) {
-          if (!/No sessions/i.test(err?.message || '')) throw err;
-          const alt = lidMap.get(normalizeJid(target));
-          if (alt && alt !== target) { try { return rememberSent(await origSend(alt, content, options)); } catch { /* fall through */ } }
-          if (Date.now() - hinted > 3600000) {
-            hinted = Date.now();
-            console.error('[HINT] "No sessions" = this WhatsApp account has a stale/extra linked device (usually left behind by an earlier deploy). Phone > WhatsApp > Linked devices: log out every old "Firefox" entry, keep only the one bot that is running now.');
-          }
-          throw err;
+        const n = normalizeJid(jid);
+        let order;
+        if (n && pn && lid && (n === pn || n === lid)) order = preferPn ? [pn, lid] : [lid, pn];
+        else { order = [jid]; const alt = lidMap.get(n); if (alt && alt !== n) order.push(alt); }   // stranger LID -> learned phone JID
+        let lastErr;
+        for (const target of order) {
+          try { return rememberSent(await origSend(target, content, options)); }
+          catch (err) { lastErr = err; if (!/No sessions/i.test(err?.message || '')) throw err; }
         }
+        if (Date.now() - hinted > 3600000) {
+          hinted = Date.now();
+          console.error('[HINT] "No sessions" = this WhatsApp account has a stale/extra linked device (usually left behind by an earlier deploy). Phone > WhatsApp > Linked devices: log out every old "Firefox" entry, keep only the one bot that is running now.');
+        }
+        throw lastErr;
       };
     }
     let pairingRequested = false;
@@ -564,31 +568,63 @@ try {
 }
 async function shutdown(signal) {
   logger.info({ signal }, 'Shutting down');
+  console.log(`[SHUTDOWN] ${signal} received — the platform (Railway) asked this container to stop (redeploy / restart / scale).`);
+  recordExit(`${signal} (stopped by Railway: redeploy, restart or maintenance)`);
   for (const timer of reconnectTimers.values()) clearTimeout(timer);
   for (const sock of sockets.values()) { try { sock.end(undefined); } catch {} }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 8000).unref();
 }
-// Heartbeat + watchdog: log health every 5 min; if the socket is silently dead (queries time out twice) or
-// the account stays disconnected for 6+ min, exit so Railway restarts the container (session stays on the volume).
+// ───────── Why did the bot restart? ─────────
+// Every minute we note that we are alive (+ memory use). On the next start we print how the previous run ended:
+// a clean stop (SIGTERM = Railway redeploy/restart), a crash (error text) or "killed without warning"
+// (almost always the container ran out of memory).
+const STATE_FILE = path.join(DATA_DIR, 'run-state.json');
+const readState = () => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; } };
+const writeState = patch => {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const cur = readState() || {};
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ ...cur, ...patch }));
+  } catch { /* best effort */ }
+};
+let exitRecorded = false;
+function recordExit(reason) {
+  if (exitRecorded) return; exitRecorded = true;
+  writeState({ exit: { reason, at: Date.now() }, lastAlive: Date.now() });
+}
+{
+  const prev = readState();
+  if (prev?.startedAt) {
+    const up = Math.round(((prev.exit?.at || prev.lastAlive || prev.startedAt) - prev.startedAt) / 60000);
+    if (prev.exit) console.log(`[BOOT] previous run ended: ${prev.exit.reason} — it had been up ${up} min (stopped ${fmtTime(prev.exit.at)}).`);
+    else console.error(`[BOOT] previous run was KILLED WITHOUT WARNING after ~${up} min (last seen alive ${fmtTime(prev.lastAlive || prev.startedAt)}, memory then ${prev.rssMB || '?'} MB). This is almost always the container running OUT OF MEMORY (or a hard crash).`);
+  } else console.log('[BOOT] first start (no previous run recorded).');
+  writeState({ startedAt: Date.now(), lastAlive: Date.now(), exit: null, rssMB: Math.round(process.memoryUsage().rss / 1048576) });
+}
+process.on('exit', code => recordExit(`process exit (code ${code})`));
+const crashTimes = [];
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT EXCEPTION]', err?.stack || err);
+  const now = Date.now(); crashTimes.push(now);
+  while (crashTimes.length && now - crashTimes[0] > 600000) crashTimes.shift();
+  recordExit(`crash: ${String(err?.message || err).slice(0, 200)}`);
+  exitRecorded = false;                                     // keep running unless it keeps happening
+  if (crashTimes.length >= 5) { console.error('[UNCAUGHT EXCEPTION] 5 in 10 minutes — exiting so Railway restarts a clean process.'); process.exit(1); }
+});
+setInterval(() => writeState({ lastAlive: Date.now(), rssMB: Math.round(process.memoryUsage().rss / 1048576) }), 60000).unref();
+
+// Heartbeat every 5 min. Baileys already pings WhatsApp and reconnects by itself when the connection drops, so we only
+// restart the process if an account has stayed disconnected for 10+ minutes.
 let downSince = 0;
-setInterval(async () => {
+setInterval(() => {
   const ids = new Set([...sockets.keys(), ...reconnectTimers.keys()]);
+  const rss = Math.round(process.memoryUsage().rss / 1048576);
   for (const id of ids) {
-    const sock = sockets.get(id);
-    if (!sock) { downSince = downSince || Date.now(); if (Date.now() - downSince > 6 * 60000) { console.error('[WATCHDOG] disconnected > 6 min, restarting'); process.exit(1); } continue; }
+    if (!sockets.get(id)) { downSince = downSince || Date.now(); if (Date.now() - downSince > 10 * 60000) { console.error('[WATCHDOG] disconnected for 10+ min, restarting'); recordExit('watchdog: disconnected for 10+ minutes'); process.exit(1); } continue; }
     downSince = 0;
-    try {
-      const num = String(sock.user?.id || '').split(':')[0].split('@')[0];
-      await Promise.race([sock.onWhatsApp(num), new Promise((_, rej) => setTimeout(() => rej(new Error('ping timeout')), 45000))]);
-      stats.pingFails = 0;
-    } catch (err) {
-      stats.pingFails++;
-      console.error(`[WATCHDOG] ping failed (${stats.pingFails}): ${err.message}`);
-      if (stats.pingFails >= 2) { console.error('[WATCHDOG] connection looks dead, restarting'); process.exit(1); }
-    }
     const last = stats.lastMsgAt ? `${Math.round((Date.now() - stats.lastMsgAt) / 60000)} min ago` : 'never';
-    console.log(`[HEARTBEAT] ${id}: connected, messages received=${stats.msgs}, last message=${last}, hidden signal-noise=${stats.noise}`);
+    console.log(`[HEARTBEAT] ${id}: connected | up ${Math.round(process.uptime() / 60)} min | memory ${rss} MB | messages=${stats.msgs}, last=${last} | hidden signal-noise=${stats.noise}`);
   }
 }, 5 * 60000).unref();
 
